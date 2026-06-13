@@ -1,6 +1,6 @@
 # juicefs-nix
 
-A NixOS module + flake to declaratively configure [JuiceFS](https://juicefs.com):
+A NixOS + nix-darwin module + flake to declaratively configure [JuiceFS](https://juicefs.com):
 format and mount volumes, run the S3-compatible gateway, and run the WebDAV server.
 
 [JuiceFS](https://juicefs.com) is a POSIX-compatible distributed filesystem. A volume
@@ -9,8 +9,10 @@ combines two backends, **both of which you provide and run yourself**:
 - a **metadata engine** — SQLite, Redis, PostgreSQL, MySQL, or TiKV;
 - **object storage** — S3, MinIO, OSS, a local directory (`file`), etc.
 
-This module wires JuiceFS up as systemd services. It does **not** manage the metadata
-database or the object store — see [Prerequisites](#prerequisites).
+The same `services.juicefs` interface works on both NixOS (systemd) and macOS via
+[nix-darwin](https://github.com/nix-darwin/nix-darwin) (launchd). The module does **not**
+manage the metadata database or the object store — see [Prerequisites](#prerequisites). On
+macOS it also requires **macFUSE** — see [macOS / nix-darwin](#macos--nix-darwin).
 
 ## Installation
 
@@ -38,6 +40,34 @@ Add the flake as an input and import the module:
   };
 }
 ```
+
+On macOS, import the nix-darwin module instead:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nix-darwin.url = "github:nix-darwin/nix-darwin";
+    juicefs-nix = {
+      url = "github:abdulrahman1s/juicefs-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { nix-darwin, juicefs-nix, ... }: {
+    darwinConfigurations.mymac = nix-darwin.lib.darwinSystem {
+      system = "aarch64-darwin";
+      modules = [
+        juicefs-nix.darwinModules.default
+        ./configuration.nix
+      ];
+    };
+  };
+}
+```
+
+See [macOS / nix-darwin](#macos--nix-darwin) for the macFUSE prerequisite and the behavioral
+differences from the NixOS module.
 
 The flake also exposes `packages.<system>.juicefs` (re-exported from nixpkgs) if you just
 want the CLI: `nix run github:abdulrahman1s/juicefs-nix`.
@@ -192,12 +222,52 @@ in the world-readable Nix store. Instead supply runtime paths produced by
 
 - **`metaPasswordFile`** — a file containing only the metadata engine password. Loaded into
   `META_PASSWORD` at service start.
-- **`environmentFile`** — a systemd `EnvironmentFile`. Use it for object storage credentials
+- **`environmentFile`** — an environment file. Use it for object storage credentials
   (`ACCESS_KEY`, `SECRET_KEY`) and, for the gateway, `MINIO_ROOT_USER` /
-  `MINIO_ROOT_PASSWORD`.
+  `MINIO_ROOT_PASSWORD`. On NixOS it is a systemd `EnvironmentFile`; on macOS (launchd has no
+  equivalent) it is **sourced** by the wrapper script, so any value containing shell
+  metacharacters must be quoted (e.g. `SECRET_KEY='a$b'`).
 
 Make sure the secret files are readable by the service's `user`/`group` and exist before the
 unit starts (e.g. order your secret provisioning before `juicefs-*.service`).
+
+## macOS / nix-darwin
+
+Import `juicefs-nix.darwinModules.default` into your `darwinSystem` (see
+[Installation](#installation)). The `services.juicefs` options are identical to NixOS, but the
+services are launchd daemons rather than systemd units, which changes a few things:
+
+- **macFUSE is required** for any mount. It is a kernel extension that **cannot** come from the
+  Nix store, so install it out of band from [macfuse.io](https://macfuse.io) (or
+  `brew install --cask macfuse`), approve the system extension in **System Settings → Privacy &
+  Security**, and **reboot**. Until macFUSE is approved, a mount daemon will crash-loop (this is
+  expected, not a module bug). The gateway / WebDAV servers do not use FUSE and need no macFUSE.
+- **No firewall integration.** `openFirewall` is a no-op on macOS (there is no
+  `networking.firewall`); a warning is emitted if you set it. Open ports via the macOS
+  Application Firewall or `pf` yourself.
+- **Logs** go to `/var/log/juicefs-<name>.log` (and `juicefs-gateway.log` / `juicefs-webdav.log`),
+  rather than the journal. Use `log show` / `tail -f` on those files.
+- **No mount-readiness barrier.** Unlike the systemd unit (which blocks on `mountpoint` before
+  dependents start), launchd has no equivalent; the daemon simply runs `juicefs mount` in the
+  foreground.
+- **Stopping** a daemon (`sudo launchctl bootout system/org.nixos.juicefs-<name>`, or
+  `darwin-rebuild switch` replacing it) sends SIGTERM, which `juicefs mount` handles by
+  unmounting cleanly. If a mount ever gets stuck, force it with `diskutil unmount force <path>`.
+- **Directories** (`mountPoint`, `cacheDir`) are created by the mount daemon itself; there is no
+  `systemd.tmpfiles` equivalent to manage. The metadata-directory caveat below still applies —
+  create the parent of an embedded SQLite DB yourself.
+- **`user`/`group`** default to `root`; the daemon then runs as root and ownership is left alone.
+  Set them to a non-root user/group to run unprivileged (mapped to launchd `UserName`/`GroupName`
+  and a `chown` of the mount/cache dirs).
+
+```nix
+services.juicefs.mounts.demo = {
+  metaUrl = "sqlite3:///var/lib/juicefs/demo.db";
+  mountPoint = "/Users/Shared/jfs-demo";
+  autoFormat = true;
+  format.bucket = "/var/lib/juicefs/demo-data";
+};
+```
 
 ## Prerequisites
 
@@ -282,7 +352,7 @@ automatically and does not need a rule.
 | `format.trashDays` | null or int | `null` | Trash retention in days (`--trash-days`). |
 | `format.extraOptions` | list of str | `[]` | Extra args for `juicefs format` (long-tail flags). |
 | `metaPasswordFile` | null or path | `null` | File with the metadata password → `META_PASSWORD`. |
-| `environmentFile` | null or path | `null` | systemd `EnvironmentFile` for `ACCESS_KEY`/`SECRET_KEY`/etc. |
+| `environmentFile` | null or path | `null` | Env file for `ACCESS_KEY`/`SECRET_KEY`/etc. (systemd `EnvironmentFile` on NixOS; sourced by the wrapper on macOS). |
 
 ### `services.juicefs.gateway` / `services.juicefs.webdav`
 
@@ -291,12 +361,14 @@ automatically and does not need a rule.
 | `enable` | bool | `false` | Enable the server. |
 | `metaUrl` | str | _required_ | Metadata engine URL of the volume to serve. |
 | `address` | str | `localhost:9005` (gateway) / `localhost:9007` (webdav) | Listen `host:port`. |
-| `openFirewall` | bool | `false` | Open the listen port in the firewall. |
+| `openFirewall` | bool | `false` | Open the listen port in the firewall. No effect on macOS. |
 | `extraOptions` | list of str | `[]` | Extra args for the server command. |
 | `metaPasswordFile` | null or path | `null` | File with the metadata password → `META_PASSWORD`. |
-| `environmentFile` | null or path | `null` | systemd `EnvironmentFile` (e.g. `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`). |
+| `environmentFile` | null or path | `null` | Env file (e.g. `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`); systemd `EnvironmentFile` on NixOS, sourced by the wrapper on macOS. |
 
 ## How it works
+
+On **NixOS** (systemd):
 
 - Each enabled mount becomes a `juicefs-<name>.service` (`Type=simple`) running
   `juicefs mount --no-syslog` in the foreground. An `ExecStartPost` hook blocks until the
@@ -305,6 +377,19 @@ automatically and does not need a rule.
   the volume is not yet initialized (idempotent — existing volumes are untouched).
 - The gateway and WebDAV servers become `juicefs-gateway.service` and
   `juicefs-webdav.service`.
+
+On **macOS** (nix-darwin / launchd):
+
+- Each mount/server becomes a launchd daemon (`org.nixos.juicefs-<name>`) with
+  `RunAtLoad`/`KeepAlive` (restart on failure). launchd runs a single program, so directory
+  creation and the idempotent `autoFormat` step are folded into the mount wrapper, and the
+  process unmounts itself on SIGTERM (no separate stop step). See
+  [macOS / nix-darwin](#macos--nix-darwin).
+
+On both platforms:
+
+- The command line is assembled by shared helpers (`modules/builders.nix`) from the same
+  `services.juicefs` options (`modules/options.nix`).
 - Secrets are read from their files at runtime inside a wrapper script, so they never enter
   the Nix store or appear in `ps`.
 
